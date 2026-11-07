@@ -893,6 +893,42 @@ impl TextLayout {
         Err(line_start_ix.saturating_sub(1))
     }
 
+    /// Get the byte index of the character boundary closest to the pixel position, as where a
+    /// selection made with the mouse ends. Positions above or below the text are held to its
+    /// first and last lines. Returns 0 before the text has been laid out.
+    ///
+    /// See also [`Self::index_for_position`], which gives the boundary before the glyph under
+    /// the position.
+    pub fn closest_index_for_position(&self, position: Point<Pixels>) -> usize {
+        let element_state = self.0.borrow();
+        let Some(element_state) = element_state.as_ref() else {
+            return 0;
+        };
+        let Some(bounds) = element_state.bounds else {
+            return 0;
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+
+        let line_height = element_state.line_height;
+        let mut line_origin = bounds.origin;
+        let mut line_start_ix = 0;
+        for line in &element_state.lines {
+            let line_bottom = line_origin.y + line.size(line_height).height;
+            if position.y >= line_bottom {
+                line_origin.y = line_bottom;
+                line_start_ix += line.len() + 1;
+            } else {
+                let index_within_line = line
+                    .closest_index_for_position(position - line_origin, line_height)
+                    .unwrap_or_else(|index| index);
+                return line_start_ix + index_within_line.min(line.len());
+            }
+        }
+        element_state.len
+    }
+
     /// Get the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         let element_state = self.0.borrow();
