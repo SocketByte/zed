@@ -6707,6 +6707,15 @@ impl Window {
         self.platform_window.activate();
     }
 
+    /// Focus the window and bring it to the foreground with an activation token another
+    /// program handed over, such as the one a launcher gave a second start of the app, or the
+    /// one a tray gave with a click. Wayland only lets a window come forward with such a token;
+    /// elsewhere this is [`Self::activate_window`].
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn activate_window_with_token(&self, token: &str) {
+        self.platform_window.activate_with_token(token);
+    }
+
     /// Requests that the operating system draw attention to this window.
     pub fn request_attention(&self) {
         self.platform_window.request_attention();

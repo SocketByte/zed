@@ -1290,6 +1290,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Brings the window forward with an activation token another program handed over, which
+    /// Wayland asks for. Elsewhere it activates the window.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn activate_with_token(&self, _token: &str) {
+        self.activate();
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
