@@ -20,6 +20,44 @@ use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
+/// Moves a list by a frame's part of its glide, as a wheel does, and again on the next frame
+/// while there's more, stopping at either end.
+fn glide_list(list_state: ListState, current_view: EntityId, window: &mut Window, cx: &mut App) {
+    let more = {
+        let mut state = list_state.0.borrow_mut();
+        let (step, more) = state.glide.step();
+        let Some(bounds) = state.last_layout_bounds else {
+            state.glide.stop();
+            return;
+        };
+        let top = state
+            .laid_out_top
+            .unwrap_or_else(|| state.logical_scroll_top());
+        let height = bounds.size.height;
+        let padding = state.last_padding.unwrap_or_default();
+        let most =
+            (state.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+        let before = state.scroll_top(&top);
+        let target = (before - step.y).max(px(0.)).min(most);
+        if step.y != px(0.) && (target - before).abs() < px(0.01) {
+            // At an end: nothing more to glide to.
+            state.glide.stop();
+            false
+        } else {
+            state.scroll(&top, height, step, current_view, window, cx);
+            // Moved from here, until the next layout says where the top is.
+            state.laid_out_top = state
+                .scroll_anchor
+                .map(|anchor| anchor.position)
+                .or(state.laid_out_top);
+            more
+        }
+    };
+    if more {
+        window.on_next_frame(move |window, cx| glide_list(list_state, current_view, window, cx));
+    }
+}
+
 /// Construct a new list element
 pub fn list(
     state: ListState,
@@ -73,6 +111,10 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     item_measurement_ready: Option<Box<dyn Fn(usize, &App) -> bool>>,
     follow_state: FollowState,
+    /// A wheel's notches gliding, and where the last layout put the top, which a glide moves
+    /// from, as a bottom-aligned list keeps no scroll anchor while at its end.
+    glide: super::Glide,
+    laid_out_top: Option<ListOffset>,
 }
 
 #[derive(Clone, Copy)]
@@ -325,6 +367,8 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             item_measurement_ready: None,
             follow_state: FollowState::default(),
+            glide: Default::default(),
+            laid_out_top: None,
         })));
         state.splice(0..0, item_count);
         state
@@ -1619,10 +1663,20 @@ impl Element for List {
         let list_state = self.state.clone();
         let height = bounds.size.height;
         let scroll_top = prepaint.layout.scroll_top;
+        list_state.0.borrow_mut().laid_out_top = Some(scroll_top);
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                // A wheel's notches glide, moving a little each frame.
+                if super::Glide::takes(&event.delta) {
+                    let delta = event.delta.pixel_delta(px(super::PIXELS_PER_LINE));
+                    let resting = list_state.0.borrow_mut().glide.add(delta);
+                    if resting {
+                        glide_list(list_state.clone(), current_view, window, cx);
+                    }
+                    return;
+                }
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
                 list_state.0.borrow_mut().scroll(
