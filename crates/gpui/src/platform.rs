@@ -3474,7 +3474,35 @@ impl Image {
             }
             ImageFormat::Png => decode_static_image(&self.bytes, image::ImageFormat::Png)?,
             ImageFormat::Jpeg => decode_static_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => decode_static_image(&self.bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Webp => {
+                // Every frame of an animated WebP, as `img` decodes one it loads itself.
+                let mut decoder =
+                    image::codecs::webp::WebPDecoder::new(Cursor::new(&self.bytes))?;
+                if decoder.has_animation() {
+                    let _ = decoder.set_background_color(image::Rgba([0, 0, 0, 0]));
+                    let mut frames = SmallVec::new();
+                    for frame in decoder.into_frames() {
+                        match frame {
+                            Ok(mut frame) => {
+                                // Convert from RGBA to BGRA.
+                                for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                                    pixel.swap(0, 2);
+                                }
+                                frames.push(frame);
+                            }
+                            Err(err) => {
+                                log::debug!("Skipping WebP frame due to decode error: {err}");
+                            }
+                        }
+                    }
+                    if frames.is_empty() {
+                        anyhow::bail!("WebP could not be decoded: all frames failed");
+                    }
+                    frames
+                } else {
+                    decode_static_image(&self.bytes, image::ImageFormat::WebP)?
+                }
+            }
             ImageFormat::Bmp => decode_static_image(&self.bytes, image::ImageFormat::Bmp)?,
             ImageFormat::Tiff => decode_static_image(&self.bytes, image::ImageFormat::Tiff)?,
             ImageFormat::Ico => decode_static_image(&self.bytes, image::ImageFormat::Ico)?,
