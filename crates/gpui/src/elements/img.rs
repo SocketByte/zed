@@ -251,9 +251,45 @@ impl DerefMut for Stateful<Img> {
 
 /// The image state between frames
 struct ImgState {
-    frame_index: usize,
-    last_frame_time: Option<Instant>,
     started_loading: Option<(Instant, Task<()>)>,
+    /// When the view is to be drawn again for an animation's next frame. Which frame to draw is
+    /// the image's own clock's ([`RenderImage::frame_at`]), never kept here.
+    next_frame: Option<(Instant, Task<()>)>,
+}
+
+/// How late a timer may fire: Windows's thread pool timers fire on its 15.6 ms tick.
+const TIMER_LATENESS: Duration = Duration::from_millis(20);
+
+/// Draws the current view again on the first frame after `due`. A timer wakes a little before,
+/// as a timer alone can fire up to a tick late, and from then each frame checks the time, which
+/// draws nothing until the frame is due.
+fn redraw_after(due: Instant, window: &mut Window, cx: &mut App) -> Task<()> {
+    let Some(view) = window.current_view_if_any() else {
+        return Task::ready(());
+    };
+    window.spawn(cx, async move |cx| {
+        let early = due
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(TIMER_LATENESS);
+        if !early.is_zero() {
+            cx.background_executor().timer(early).await;
+        }
+        loop {
+            let (sent, arrived) = futures::channel::oneshot::channel();
+            let asked = cx.update(|window, _| {
+                window.on_next_frame(move |_, cx| {
+                    let ready = Instant::now() >= due;
+                    if ready {
+                        cx.notify(view);
+                    }
+                    sent.send(ready).ok();
+                })
+            });
+            if asked.is_err() || !matches!(arrived.await, Ok(false)) {
+                break;
+            }
+        }
+    })
 }
 
 /// The image layout state between frames
@@ -289,13 +325,12 @@ impl Element for Img {
         window.with_optional_element_state(global_id, |state, window| {
             let mut state = state.map(|state| {
                 state.unwrap_or(ImgState {
-                    frame_index: 0,
-                    last_frame_time: None,
                     started_loading: None,
+                    next_frame: None,
                 })
             });
 
-            let mut frame_index = state.as_ref().map(|state| state.frame_index).unwrap_or(0);
+            let mut frame_index = 0;
 
             let layout_id = self.interactivity.request_layout(
                 global_id,
@@ -313,36 +348,17 @@ impl Element for Img {
                         cx,
                     ) {
                         Some(Ok(data)) => {
-                            let frame_count = data.frame_count();
-                            let max_frame_index = frame_count.saturating_sub(1);
-
+                            // The frame the image's own clock is at. An element that stepped its
+                            // own frame along drew frames late and unevenly, started over when it
+                            // came back into view, and never moved with other copies of the image.
+                            let (frame, next_frame_due) = if cx.reduce_motion() {
+                                (0, None)
+                            } else {
+                                data.frame_at(Instant::now())
+                            };
+                            frame_index = frame;
                             if let Some(state) = &mut state {
-                                state.frame_index = state.frame_index.min(max_frame_index);
-                                if frame_count > 1 && !cx.reduce_motion() {
-                                    if window.is_window_active() {
-                                        let current_time = Instant::now();
-                                        if let Some(last_frame_time) = state.last_frame_time {
-                                            let elapsed = current_time - last_frame_time;
-                                            let frame_duration =
-                                                Duration::from(data.delay(state.frame_index));
-
-                                            if elapsed >= frame_duration {
-                                                state.frame_index =
-                                                    (state.frame_index + 1) % frame_count;
-                                                state.last_frame_time =
-                                                    Some(current_time - (elapsed - frame_duration));
-                                            }
-                                        } else {
-                                            state.last_frame_time = Some(current_time);
-                                        }
-                                    } else {
-                                        state.last_frame_time = None;
-                                    }
-                                } else {
-                                    state.last_frame_time = None;
-                                }
                                 state.started_loading = None;
-                                frame_index = state.frame_index;
                             }
 
                             let image_size = data.render_size(frame_index);
@@ -379,12 +395,26 @@ impl Element for Img {
                                 };
                             }
 
-                            if global_id.is_some()
-                                && data.frame_count() > 1
-                                && window.is_window_active()
-                                && !cx.reduce_motion()
-                            {
-                                window.request_animation_frame();
+                            // Drawn again on the first frame after the next one is due, rather
+                            // than on every vsync, which drew the whole view 240 times a second
+                            // on a 240 Hz display for an animation of 20 frames a second. Every
+                            // copy waits for the same moment, so they're drawn together. As in a
+                            // browser, it keeps moving while the window is visible but not
+                            // focused.
+                            if let Some(due) = next_frame_due {
+                                match &mut state {
+                                    Some(state) => {
+                                        if !state
+                                            .next_frame
+                                            .as_ref()
+                                            .is_some_and(|(at, _)| *at == due)
+                                        {
+                                            state.next_frame =
+                                                Some((due, redraw_after(due, window, cx)));
+                                        }
+                                    }
+                                    None => redraw_after(due, window, cx).detach(),
+                                }
                             }
                         }
                         Some(_err) => {
@@ -487,10 +517,16 @@ impl Element for Img {
                     if data.frame_count() == 0 {
                         return;
                     }
+                    // Held to the image painted, should it differ from the one laid out.
+                    let frame_index = if layout_state.frame_index < data.frame_count() {
+                        layout_state.frame_index
+                    } else {
+                        0
+                    };
                     let new_bounds = self
                         .style
                         .object_fit
-                        .get_bounds(bounds, data.size(layout_state.frame_index));
+                        .get_bounds(bounds, data.size(frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
                     window
                         .paint_image(
@@ -498,7 +534,7 @@ impl Element for Img {
                             new_bounds,
                             corner_radii,
                             data,
-                            layout_state.frame_index,
+                            frame_index,
                             self.style.grayscale,
                         )
                         .log_err();
@@ -802,7 +838,7 @@ impl From<image::ImageError> for ImageCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParentElement as _, TestAppContext, canvas, div, point, px, size};
+    use crate::{ParentElement as _, TestAppContext, div, point, px, size};
     use image::{Frame, ImageBuffer, Rgba};
 
     const TEST_IMG_ID: &str = "test-img";
@@ -819,19 +855,19 @@ mod tests {
         Arc::new(RenderImage::new(SmallVec::from_elem(frame, 1)))
     }
 
-    /// Overwrites the cached `frame_index` of the sibling `img` during paint.
-    fn seed_frame_index(frame_index: usize) -> impl IntoElement {
-        canvas(
-            |_, _, _| (),
-            move |_, _, window, _| {
-                window.with_global_id(TEST_IMG_ID.into(), |id, window| {
-                    window.with_element_state::<ImgState, _>(id, |state, _| {
-                        let mut state = state.expect("img state should be initialized");
-                        state.frame_index = frame_index;
-                        ((), state)
-                    });
-                });
-            },
+    fn animation(delays_ms: &[u32]) -> RenderImage {
+        RenderImage::new(
+            delays_ms
+                .iter()
+                .map(|&ms| {
+                    Frame::from_parts(
+                        ImageBuffer::from_pixel(2, 2, Rgba([0, 0, 0, 0])),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(ms, 1),
+                    )
+                })
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -962,16 +998,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn stale_frame_index_is_clamped_when_image_changes(cx: &mut TestAppContext) {
+    fn replacing_an_animation_with_fewer_frames_does_not_panic(cx: &mut TestAppContext) {
         let window = cx.add_empty_window();
-
-        // Assert that a cached frame_index from a previous multi-frame image
-        // does not cause an out-of-bounds panic when the image is replaced
-        // with one that has fewer frames.
+        let animated = Arc::new(animation(&[40, 40, 40, 40, 40]));
+        // Its clock starts at the first draw and is at the last frame by the second.
+        animated.frame_at(Instant::now() - Duration::from_millis(190));
         window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
-            div()
-                .child(img(ImageSource::Render(test_image(5))).id(TEST_IMG_ID))
-                .child(seed_frame_index(4))
+            img(ImageSource::Render(animated.clone()))
+                .id(TEST_IMG_ID)
                 .into_any_element()
         });
         window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
@@ -979,5 +1013,43 @@ mod tests {
                 .id(TEST_IMG_ID)
                 .into_any_element()
         });
+    }
+
+    #[test]
+    fn copies_of_an_animation_show_the_frame_its_clock_is_at() {
+        let image = animation(&[40, 60, 100]);
+        let start = Instant::now();
+        // Its clock starts when it's first asked, and every copy asking later reads the same one.
+        assert_eq!(
+            image.frame_at(start),
+            (0, Some(start + Duration::from_millis(40)))
+        );
+        let later = start + Duration::from_millis(50);
+        assert_eq!(
+            image.frame_at(later),
+            (1, Some(start + Duration::from_millis(100)))
+        );
+        assert_eq!(image.frame_at(later), image.frame_at(later));
+        // However late a redraw comes, it's the frame that's due, and it goes round.
+        assert_eq!(image.frame_at(start + Duration::from_millis(150)).0, 2);
+        assert_eq!(
+            image.frame_at(start + Duration::from_millis(210)),
+            (0, Some(start + Duration::from_millis(240)))
+        );
+    }
+
+    #[test]
+    fn frames_of_10_ms_or_less_last_100_ms_as_in_browsers() {
+        let image = animation(&[0, 10, 20]);
+        let start = Instant::now();
+        assert_eq!(image.frame_at(start).0, 0);
+        assert_eq!(image.frame_at(start + Duration::from_millis(99)).0, 0);
+        assert_eq!(image.frame_at(start + Duration::from_millis(150)).0, 1);
+        assert_eq!(image.frame_at(start + Duration::from_millis(205)).0, 2);
+    }
+
+    #[test]
+    fn a_still_image_has_one_frame_and_nothing_due() {
+        assert_eq!(animation(&[50]).frame_at(Instant::now()), (0, None));
     }
 }

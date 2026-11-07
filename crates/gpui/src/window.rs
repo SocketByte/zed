@@ -5399,6 +5399,11 @@ impl Window {
         self.rendered_entity_stack.last().copied().unwrap()
     }
 
+    /// The view being drawn, if an element is drawn inside one.
+    pub(crate) fn current_view_if_any(&self) -> Option<EntityId> {
+        self.rendered_entity_stack.last().copied()
+    }
+
     #[inline]
     pub(crate) fn with_rendered_view<R>(
         &mut self,

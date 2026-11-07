@@ -2,11 +2,16 @@ use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
 use smallvec::SmallVec;
 
 use image::{Delay, Frame};
+use scheduler::Instant;
 use std::{
     borrow::Cow,
     fmt,
     hash::Hash,
-    sync::atomic::{AtomicUsize, Ordering::SeqCst},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    },
+    time::Duration,
 };
 
 /// A source of assets for this app to use.
@@ -46,6 +51,8 @@ pub struct RenderImage {
     /// The scale factor of this image on render.
     pub(crate) scale_factor: f32,
     data: SmallVec<[Frame; 1]>,
+    /// When an animated image was first drawn, which its clock counts from.
+    started: OnceLock<Instant>,
 }
 
 impl PartialEq for RenderImage {
@@ -65,7 +72,37 @@ impl RenderImage {
             id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
             scale_factor: 1.0,
             data: data.into(),
+            started: OnceLock::new(),
         }
+    }
+
+    /// The frame an animated image is at, by its own clock, and when its next frame is due.
+    /// A still image gives its only frame and `None`.
+    ///
+    /// Every element drawing this image shares the clock, which starts when it's first asked,
+    /// so copies of an animation move together, as a browser's copies of an image do. As in
+    /// browsers, a frame of 10 ms or less lasts 100 ms.
+    pub fn frame_at(&self, now: Instant) -> (usize, Option<Instant>) {
+        if self.data.len() < 2 {
+            return (0, None);
+        }
+        let shown = |frame: &Frame| match Duration::from(frame.delay()) {
+            delay if delay <= Duration::from_millis(10) => Duration::from_millis(100),
+            delay => delay,
+        };
+        let cycle: Duration = self.data.iter().map(shown).sum();
+        let started = *self.started.get_or_init(|| now);
+        let into = Duration::from_nanos(
+            (now.saturating_duration_since(started).as_nanos() % cycle.as_nanos()) as u64,
+        );
+        let mut end = Duration::ZERO;
+        for (index, frame) in self.data.iter().enumerate() {
+            end += shown(frame);
+            if into < end {
+                return (index, Some(now + (end - into)));
+            }
+        }
+        (0, Some(now + (cycle - into)))
     }
 
     /// Convert this image into a byte slice.
