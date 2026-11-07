@@ -190,6 +190,10 @@ impl DisplayConnection {
         dispatch!(self, connection => connection.read_from_clipboard(), headless => None)
     }
 
+    pub(crate) fn read_paths_from_clipboard(&self) -> Vec<PathBuf> {
+        dispatch!(self, connection => connection.read_paths_from_clipboard(), headless => Vec::new())
+    }
+
     #[cfg(any(feature = "wayland", feature = "x11"))]
     pub(crate) fn window_identifier(
         &self,

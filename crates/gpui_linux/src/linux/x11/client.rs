@@ -1861,6 +1861,11 @@ impl X11Client {
             .log_with_level(log::Level::Debug)
     }
 
+    /// Files copied in a file manager aren't read on X11 yet.
+    pub(crate) fn read_paths_from_clipboard(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
     pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
         let state = self.0.borrow_mut();
         // if the last copy was from this app, return our cached item

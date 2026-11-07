@@ -587,6 +587,13 @@ pub trait Platform: 'static {
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
 
+    /// The files a file manager copied to the clipboard, which it offers as `text/uri-list`
+    /// rather than as text or an image.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn read_paths_from_clipboard(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
     /// Reads the clipboard, resolving once its contents are available.
     ///
     /// Most platforms read synchronously and return a ready task. Platforms

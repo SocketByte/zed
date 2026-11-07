@@ -1488,6 +1488,10 @@ impl WaylandConnection {
         self.0.borrow_mut().clipboard.read()
     }
 
+    pub(crate) fn read_paths_from_clipboard(&self) -> Vec<std::path::PathBuf> {
+        self.0.borrow_mut().clipboard.read_paths()
+    }
+
     pub(crate) fn active_window(&self) -> Option<AnyWindowHandle> {
         self.0
             .borrow_mut()

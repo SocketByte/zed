@@ -1173,6 +1173,10 @@ impl Platform for LinuxPlatform {
         self.connection.borrow().read_from_clipboard()
     }
 
+    fn read_paths_from_clipboard(&self) -> Vec<PathBuf> {
+        self.connection.borrow().read_paths_from_clipboard()
+    }
+
     fn add_recent_document(&self, _path: &Path) {}
 }
 
