@@ -1422,15 +1422,17 @@ impl App {
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
     ) -> (R, FxHashSet<EntityId>) {
-        let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
+        // What the callback itself touched, not what it touched that nothing had earlier in the
+        // frame: a view drawn earlier in the frame would otherwise leave itself out of its own
+        // set, and once its drawing was reused, notifying it would draw nothing.
+        let outer = std::mem::take(self.entities.accessed_entities.get_mut());
         let result = callback(self);
-        let entities_accessed_in_callback = self
-            .entities
+        let entities_accessed_in_callback =
+            std::mem::replace(self.entities.accessed_entities.get_mut(), outer);
+        self.entities
             .accessed_entities
             .get_mut()
-            .difference(&accessed_entities_start)
-            .copied()
-            .collect::<FxHashSet<EntityId>>();
+            .extend(entities_accessed_in_callback.iter().copied());
         (result, entities_accessed_in_callback)
     }
 
