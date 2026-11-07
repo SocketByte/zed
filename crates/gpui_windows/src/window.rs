@@ -1041,6 +1041,15 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    /// The vsync thread sleeps until a window wants a frame, which this wakes it for.
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        Some(Rc::new(crate::want_frame))
+    }
+
+    fn schedule_frame(&self) {
+        crate::want_frame();
+    }
+
     #[cfg(feature = "test-support")]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state

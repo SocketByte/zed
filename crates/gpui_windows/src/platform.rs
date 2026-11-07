@@ -433,9 +433,10 @@ impl WindowsPlatform {
     /// Stops vsync and releases the DirectX devices. No window may be open.
     fn detach_gpu(&self) {
         if let Some(stop) = self.vsync_stop.borrow_mut().take() {
-            // Not joined: the thread can be sending this thread a message. It exits after its
-            // next vsync, and drops its reference to the devices then.
+            // Not joined: the thread can be sending this thread a message. It exits once it
+            // wakes, which this asks for, and drops its reference to the devices then.
             stop.store(true, Ordering::Release);
+            want_frame();
         }
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.release_gpu();
@@ -463,8 +464,19 @@ impl WindowsPlatform {
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
+                let mut last_redraw: Option<std::time::Instant> = None;
                 loop {
-                    let signal_source = vsync_provider.wait_for_vsync();
+                    // Asleep until a window wants a frame, waking each second to check the
+                    // device. The first frame after a rest is drawn at once, so what input
+                    // changed shows a vblank sooner; the frames after it keep to vsync.
+                    let mut wanted = wait_for_wanted_frame(std::time::Duration::from_secs(1));
+                    let signal_source = if wanted
+                        && last_redraw.is_some_and(|at| at.elapsed() < vsync_provider.interval)
+                    {
+                        vsync_provider.wait_for_vsync()
+                    } else {
+                        FrameRequestSource::LocalSchedule
+                    };
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     if stop.load(Ordering::Acquire) {
                         break;
@@ -481,10 +493,17 @@ impl WindowsPlatform {
                         ) {
                             panic!("Device lost: {err}");
                         }
+                        // Every window draws again on the new device.
+                        wanted = true;
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
                     };
+                    if !wanted {
+                        continue;
+                    }
+                    take_wanted_frame();
+                    last_redraw = Some(std::time::Instant::now());
                     for hwnd in all_windows.read().iter() {
                         unsafe {
                             if let Some(signal_at) = signal_at {
