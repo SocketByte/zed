@@ -12,7 +12,8 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Hsla, ImageId, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent,
+    KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
@@ -80,6 +81,70 @@ use crate::util::{
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
 };
 pub use prompts::*;
+
+/// When an image was last in a frame drawn, how many frames it has, and the image an `img`
+/// decoded it from, which the asset cache holds, with how many bytes that came to.
+struct SeenImage {
+    frames: usize,
+    source: Option<Arc<crate::Image>>,
+    bytes: usize,
+    at: Instant,
+}
+
+thread_local! {
+    static SEEN_IMAGES: RefCell<FxHashMap<ImageId, SeenImage>> = RefCell::default();
+    static IMAGES_SWEPT: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Images an `img` has asked to be decoded and hasn't drawn yet, by the image they're
+    /// decoded from, with when one last asked.
+    static WANTED_IMAGES: RefCell<FxHashMap<u64, (Arc<crate::Image>, Instant)>> = RefCell::default();
+}
+
+/// How long an image being decoded is kept once nothing asks for it any more. Rows scrolled
+/// past start their images' decoding, which finishes after they've gone, and nothing draws
+/// them, so nothing else would let go of them.
+const FORGET_UNWANTED_IMAGES_AFTER: Duration = Duration::from_secs(10);
+/// How long an image out of every frame is kept, decoded and on the graphics card.
+const FORGET_UNSEEN_IMAGES_AFTER: Duration = Duration::from_secs(60);
+const SWEEP_IMAGES_EVERY: Duration = Duration::from_secs(15);
+/// How much of what `img` decoded may be out of view before the least recently seen goes at
+/// once, as a browser keeps its decoded images to a budget. Scrolling through a thousand
+/// animated images otherwise decodes them all within a minute.
+const DECODED_IMAGES_OUT_OF_VIEW: usize = 128 << 20;
+
+/// An `img` is waiting for this image to be decoded.
+pub(crate) fn note_image_wanted(source: &Arc<crate::Image>) {
+    WANTED_IMAGES.with(|wanted| {
+        wanted
+            .borrow_mut()
+            .entry(source.id())
+            .and_modify(|(_, at)| *at = Instant::now())
+            .or_insert_with(|| (source.clone(), Instant::now()));
+    });
+}
+
+/// The image an `img` decoded this one from, so that it's let go of in the asset cache too
+/// once it's been out of every frame for a while.
+pub(crate) fn note_image_source(
+    id: ImageId,
+    frames: usize,
+    bytes: usize,
+    source: &Arc<crate::Image>,
+) {
+    SEEN_IMAGES.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        let image = seen.entry(id).or_insert(SeenImage {
+            frames,
+            source: None,
+            bytes: 0,
+            at: Instant::now(),
+        });
+        if image.source.is_none() {
+            image.source = Some(source.clone());
+            image.bytes = bytes;
+        }
+    });
+    WANTED_IMAGES.with(|wanted| wanted.borrow_mut().remove(&source.id()));
+}
 
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
@@ -1058,6 +1123,9 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// Each image painted in this frame, with its number of frames, including those in
+    /// painting reused from the frame before.
+    pub(crate) painted_images: Vec<(ImageId, usize)>,
 }
 
 #[derive(Clone, Default)]
@@ -1081,6 +1149,7 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
+    painted_images_index: usize,
 }
 
 impl Frame {
@@ -1117,6 +1186,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            painted_images: Vec::new(),
         }
     }
 
@@ -1133,6 +1203,7 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.painted_images.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -3598,6 +3669,7 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
+        self.forget_unseen_images(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
@@ -3622,6 +3694,132 @@ impl Window {
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
         arena_scope.exit(&cx.element_arena)
+    }
+
+    /// Notes the images in the frame just drawn, and lets go of those that haven't been in any
+    /// window's frame for a while: off the graphics card, and out of the asset cache for one an
+    /// `img` decoded. Otherwise each is kept for as long as the app runs, every photo, avatar
+    /// and frame of every animation ever shown. One that comes back is decoded again.
+    ///
+    /// Past a budget of what's decoded and out of view, the least recently seen go at once, from
+    /// this window: another may still show them, and decodes them again when it's next drawn.
+    fn forget_unseen_images(&mut self, cx: &mut App) {
+        let now = Instant::now();
+        let unwanted: Vec<Arc<crate::Image>> = WANTED_IMAGES.with(|wanted| {
+            let mut wanted = wanted.borrow_mut();
+            let ids: Vec<u64> = wanted
+                .iter()
+                .filter(|(_, (_, at))| now.duration_since(*at) >= FORGET_UNWANTED_IMAGES_AFTER)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| wanted.remove(&id).map(|(source, _)| source))
+                .collect()
+        });
+        for source in unwanted {
+            crate::forget_decoded(&source, cx);
+        }
+
+        let out_of_view = SEEN_IMAGES.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            for &(id, frames) in &self.rendered_frame.painted_images {
+                seen.entry(id)
+                    .and_modify(|image| image.at = now)
+                    .or_insert(SeenImage {
+                        frames,
+                        source: None,
+                        bytes: 0,
+                        at: now,
+                    });
+            }
+            seen.values()
+                .filter(|image| image.source.is_some() && image.at < now)
+                .map(|image| image.bytes)
+                .sum::<usize>()
+        });
+        let due = !IMAGES_SWEPT
+            .get()
+            .is_some_and(|at| now.duration_since(at) < SWEEP_IMAGES_EVERY);
+        let over = out_of_view > DECODED_IMAGES_OUT_OF_VIEW;
+        if !due && !over {
+            return;
+        }
+        if due {
+            IMAGES_SWEPT.set(Some(now));
+        }
+
+        let (unseen, crowded) = SEEN_IMAGES.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            let old: Vec<ImageId> = if due {
+                seen.iter()
+                    .filter(|(_, image)| now.duration_since(image.at) >= FORGET_UNSEEN_IMAGES_AFTER)
+                    .map(|(id, _)| *id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let unseen: Vec<(ImageId, SeenImage)> = old
+                .into_iter()
+                .filter_map(|id| seen.remove(&id).map(|image| (id, image)))
+                .collect();
+            let mut crowded = Vec::new();
+            if over {
+                let mut left = out_of_view.saturating_sub(
+                    unseen
+                        .iter()
+                        .filter(|(_, image)| image.source.is_some())
+                        .map(|(_, image)| image.bytes)
+                        .sum::<usize>(),
+                );
+                let mut oldest: Vec<(Instant, ImageId)> = seen
+                    .iter()
+                    .filter(|(_, image)| image.source.is_some() && image.at < now)
+                    .map(|(id, image)| (image.at, *id))
+                    .collect();
+                oldest.sort();
+                for (_, id) in oldest {
+                    if left <= DECODED_IMAGES_OUT_OF_VIEW {
+                        break;
+                    }
+                    if let Some(image) = seen.remove(&id) {
+                        left = left.saturating_sub(image.bytes);
+                        crowded.push((id, image));
+                    }
+                }
+            }
+            (unseen, crowded)
+        });
+
+        for (id, image) in unseen {
+            for frame_index in 0..image.frames {
+                let key = RenderImageParams {
+                    image_id: id,
+                    frame_index,
+                }
+                .into();
+                self.sprite_atlas.remove(&key);
+                for window in cx.windows.values_mut().flatten() {
+                    window.sprite_atlas.remove(&key);
+                }
+            }
+            if let Some(source) = image.source {
+                crate::forget_decoded(&source, cx);
+            }
+        }
+        for (id, image) in crowded {
+            for frame_index in 0..image.frames {
+                self.sprite_atlas.remove(
+                    &RenderImageParams {
+                        image_id: id,
+                        frame_index,
+                    }
+                    .into(),
+                );
+            }
+            if let Some(source) = image.source {
+                crate::forget_decoded(&source, cx);
+            }
+        }
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
@@ -4101,6 +4299,7 @@ impl Window {
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
+            painted_images_index: self.next_frame.painted_images.len(),
         }
     }
 
@@ -4140,6 +4339,10 @@ impl Window {
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
+        );
+        self.next_frame.painted_images.extend_from_slice(
+            &self.rendered_frame.painted_images
+                [range.start.painted_images_index..range.end.painted_images_index],
         );
 
         self.text_system
@@ -5132,6 +5335,9 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
+        self.next_frame
+            .painted_images
+            .push((data.id, data.frame_count()));
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 

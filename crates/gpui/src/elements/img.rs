@@ -257,6 +257,12 @@ struct ImgState {
     next_frame: Option<(Instant, Task<()>)>,
 }
 
+/// Lets go of an image an `img` decoded from an [`Image`], in the asset cache, once it's been
+/// out of every frame for a while (`Window::forget_unseen_images`).
+pub(crate) fn forget_decoded(source: &Arc<Image>, cx: &mut App) {
+    cx.remove_asset::<AssetLogger<ImageDecoder>>(source);
+}
+
 /// How late a timer may fire: Windows's thread pool timers fire on its 15.6 ms tick.
 const TIMER_LATENESS: Duration = Duration::from_millis(20);
 
@@ -348,6 +354,19 @@ impl Element for Img {
                         cx,
                     ) {
                         Some(Ok(data)) => {
+                            if let ImageSource::Image(source) = &self.source {
+                                let size = data.size(0);
+                                let bytes = size.width.0.max(0) as usize
+                                    * size.height.0.max(0) as usize
+                                    * 4
+                                    * data.frame_count();
+                                crate::window::note_image_source(
+                                    data.id,
+                                    data.frame_count(),
+                                    bytes,
+                                    source,
+                                );
+                            }
                             // The frame the image's own clock is at. An element that stepped its
                             // own frame along drew frames late and unevenly, started over when it
                             // came back into view, and never moved with other copies of the image.
@@ -428,6 +447,9 @@ impl Element for Img {
                             }
                         }
                         None => {
+                            if let ImageSource::Image(source) = &self.source {
+                                crate::window::note_image_wanted(source);
+                            }
                             if let Some(state) = &mut state {
                                 if let Some((started_loading, _)) = state.started_loading {
                                     if started_loading.elapsed() > LOADING_DELAY
