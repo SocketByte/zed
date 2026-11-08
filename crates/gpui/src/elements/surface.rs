@@ -110,8 +110,10 @@ impl Element for Surface {
                     CVPixelBufferGetHeight(surface).into(),
                 );
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
-                // TODO: Add support for corner_radii
-                window.paint_surface(new_bounds, surface.clone());
+                let mut style = Style::default();
+                style.refine(&self.style);
+                let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                window.paint_surface(bounds, new_bounds, corner_radii, surface.clone());
             }
             #[allow(unreachable_patterns)]
             _ => {}

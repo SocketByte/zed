@@ -5400,25 +5400,37 @@ impl Window {
         Ok(())
     }
 
-    /// Paint a surface into the scene for the next frame at the current z-index.
+    /// Paint a surface into the scene for the next frame at the current z-index: the picture
+    /// at `image_bounds`, shown where it overlaps `bounds`, with that part's corners rounded,
+    /// as `paint_image` does.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn paint_surface(
         &mut self,
         bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
         image_buffer: CFRetained<CVPixelBuffer>,
     ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
-        let bounds = self.snap_bounds(bounds);
+        let visible_bounds = bounds.intersect(&image_bounds);
+        if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
+            return;
+        }
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(visible_bounds.size)
+            .scale(self.scale_factor());
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
-            bounds,
+            bounds: self.snap_bounds(image_bounds),
             content_mask,
+            visible_bounds: self.snap_bounds(visible_bounds),
+            corner_radii,
             image_buffer,
         });
     }

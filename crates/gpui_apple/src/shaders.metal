@@ -850,12 +850,17 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  // What's shown of the picture, as origin and size, and its corners' radii.
+  float4 visible_bounds [[flat]];
+  float4 corner_radii [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  float4 visible_bounds [[flat]];
+  float4 corner_radii [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -878,6 +883,10 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      float4(surface.visible_bounds.origin.x, surface.visible_bounds.origin.y,
+             surface.visible_bounds.size.width, surface.visible_bounds.size.height),
+      float4(surface.corner_radii.top_left, surface.corner_radii.top_right,
+             surface.corner_radii.bottom_right, surface.corner_radii.bottom_left),
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -895,8 +904,22 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   float4 ycbcr = float4(
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+  float4 color = ycbcrToRGBTransform * ycbcr;
 
-  return ycbcrToRGBTransform * ycbcr;
+  // Only what's shown, with its corners rounded and their edges smoothed.
+  Bounds_ScaledPixels visible_bounds;
+  visible_bounds.origin.x = input.visible_bounds.x;
+  visible_bounds.origin.y = input.visible_bounds.y;
+  visible_bounds.size.width = input.visible_bounds.z;
+  visible_bounds.size.height = input.visible_bounds.w;
+  Corners_ScaledPixels corner_radii;
+  corner_radii.top_left = input.corner_radii.x;
+  corner_radii.top_right = input.corner_radii.y;
+  corner_radii.bottom_right = input.corner_radii.z;
+  corner_radii.bottom_left = input.corner_radii.w;
+  float distance = quad_sdf(input.position.xy, visible_bounds, corner_radii);
+  color.a *= saturate(0.5 - distance);
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

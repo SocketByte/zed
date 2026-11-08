@@ -2,8 +2,8 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -1613,6 +1613,8 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            visible_bounds: surface.visible_bounds,
+            corner_radii: surface.corner_radii,
         }))?,
     })
 }
@@ -1811,6 +1813,8 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub visible_bounds: Bounds<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -1851,14 +1855,14 @@ mod tests {
     use super::*;
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{
-        CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
+        CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
         CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
     use objc2_metal::MTLCommandBufferStatus;
 
-    #[test]
-    fn render_core_video_surface() {
+    /// A 16 by 16 picture, grey all over.
+    fn grey_surface() -> CFRetained<CVPixelBuffer> {
         let surface_properties_key = unsafe { kCVPixelBufferIOSurfacePropertiesKey };
         let attributes = CFDictionary::from_slices(
             &[surface_properties_key],
@@ -1896,7 +1900,12 @@ mod tests {
                 kCVReturnSuccess
             );
         }
+        image_buffer
+    }
 
+    #[test]
+    fn render_core_video_surface() {
+        let image_buffer = grey_surface();
         let bounds = Bounds {
             origin: Point::default(),
             size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
@@ -1906,6 +1915,8 @@ mod tests {
             order: 0,
             bounds,
             content_mask: ContentMask { bounds },
+            visible_bounds: bounds,
+            corner_radii: Corners::default(),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);
@@ -1959,5 +1970,43 @@ mod tests {
         command_buffer.waitUntilCompleted();
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
+    }
+
+    #[test]
+    fn render_rounded_core_video_surface() {
+        // Twice the size of what's shown, as a picture covering its element is.
+        let shown = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds: Bounds {
+                origin: point(ScaledPixels(-8.0), ScaledPixels(-8.0)),
+                size: size(ScaledPixels(32.0), ScaledPixels(32.0)),
+            },
+            content_mask: ContentMask { bounds: shown },
+            visible_bounds: shown,
+            corner_radii: Corners::all(ScaledPixels(6.0)),
+            image_buffer: grey_surface(),
+        });
+        scene.finish();
+
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+                .unwrap();
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+            .unwrap();
+        // The headless renderer clears to black, which the corners show.
+        for (x, y) in [(0, 0), (15, 0), (0, 15), (15, 15)] {
+            assert_eq!(image.get_pixel(x, y)[0], 0, "the corner at {x}, {y} is cut away");
+        }
+        for (x, y) in [(8, 8), (0, 8), (8, 0), (15, 8), (8, 15)] {
+            assert!(image.get_pixel(x, y)[0].abs_diff(128) <= 2, "{x}, {y} is shown");
+        }
+        let edge = image.get_pixel(1, 1)[0];
+        assert!(edge > 0 && edge < 128, "the curve's edge is smoothed, at {edge}");
     }
 }
