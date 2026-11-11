@@ -1014,7 +1014,9 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // Behind the window's child windows rather than over them, so that a native view an app
+        // puts in its window, as a web view, shows rather than being covered by the frame.
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
